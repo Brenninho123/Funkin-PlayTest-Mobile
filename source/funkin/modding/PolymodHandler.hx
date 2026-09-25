@@ -19,22 +19,25 @@ import funkin.save.Save;
 import funkin.util.FileUtil;
 import funkin.util.SortUtil;
 import funkin.util.macro.ClassMacro;
+import lime.app.Future;
 import polymod.Polymod;
-import polymod.PolymodAssets.PolymodAssetType;
+import polymod.format.ParseRules;
 import polymod.format.ParseRules.TextFileFormat;
 import polymod.fs.ZipFileSystem;
+import polymod.hscript._internal.PolymodScriptClass;
+
+typedef ScriptLoadResult =
+{
+  success:Int,
+  total:Int
+}
 
 @:nullSafety
 class PolymodHandler
 {
-  public static var API_VERSION(get, never):String;
+  public static final API_VERSION:String = '0.8.5';
 
-  static function get_API_VERSION():String
-  {
-    return Constants.VERSION;
-  }
-
-  public static final API_VERSION_RULE:String = '*';
+  public static final API_VERSION_RULE:String = '>=0.8.5 <0.8.6';
 
   public static var MOD_FOLDER(get, never):String;
 
@@ -51,18 +54,25 @@ class PolymodHandler
     #end
   }
 
-  public static final CORE_FOLDER:Null<String> =
-    #if (REDIRECT_ASSETS_FOLDER && mac)
-    '../../../../../../../assets'
-    #elseif REDIRECT_ASSETS_FOLDER
-    '../../../../assets'
-    #else
-    null
-    #end;
+  public static final CORE_FOLDER:Null<String> = #if (REDIRECT_ASSETS_FOLDER && mac) '../../../../../../../assets' #elseif REDIRECT_ASSETS_FOLDER '../../../../assets' #else null #end;
 
-  public static var loadedModDirs:Array<String> = [];
+  static final IGNORED_FILES:Array<String> = [
+    '.vscode',
+    '.idea',
+    '.git',
+    '.gitignore',
+    '.gitattributes',
+    '.jj',
+    '.DS_Store',
+    'README.md',
+    'cppia-src',
+    'build.sh',
+    'build.ps1'
+  ];
 
-  public static var loadedModIds:Array<String> = [];
+  public static var loadedModDirs(default, null):Array<String> = [];
+
+  public static var loadedModIds(default, null):Array<String> = [];
 
   static var modFileSystem:Null<ZipFileSystem> = null;
 
@@ -73,90 +83,70 @@ class PolymodHandler
 
   public static function loadAllMods():Void
   {
-    #if sys
-    createModRoot();
-    #end
+    prepareModRoot();
     loadModsById(getAllModIds());
   }
 
   public static function loadEnabledMods():Void
   {
-    #if sys
-    createModRoot();
-    #end
+    prepareModRoot();
     loadModsById(Save.instance.enabledModIds.value);
   }
 
   public static function loadNoMods():Void
   {
+    prepareModRoot();
+    loadModsById([]);
+  }
+
+  static inline function prepareModRoot():Void
+  {
     #if sys
     createModRoot();
     #end
-    loadModsById([]);
   }
 
   public static function loadModsById(modIds:Array<String>):Void
   {
     buildImports();
+    ScriptGuard.clear();
 
-    funkin.modding.ScriptGuard.clear();
+    var fileSystem:Null<ZipFileSystem> = tryGetFileSystem();
+    var availableIds:Array<String> = getAllModIds();
+    var validIds:Array<String> = modIds.filter(id -> availableIds.contains(id));
 
-    try
-    {
-      if (modFileSystem == null) modFileSystem = buildFileSystem();
-    }
-    catch (e:Dynamic)
-    {
-    }
-
-    var allModIds:Array<String> = getAllModIds();
-    var toRemove:Array<String> = [];
-    for (modId in modIds)
-    {
-      if (!allModIds.contains(modId))
-      {
-        toRemove.push(modId);
-      }
-    }
-
-    for (modId in toRemove) modIds.remove(modId);
-
-    var loadedModList:Array<ModMetadata> = polymod.Polymod.init({
+    var loadedModList:Null<Array<ModMetadata>> = Polymod.init({
       modRoot: MOD_FOLDER,
-      modIds: modIds,
+      modIds: validIds,
       framework: OPENFL,
       apiVersionRule: API_VERSION_RULE,
       errorCallback: PolymodErrorHandler.onPolymodError,
-
-      customFilesystem: modFileSystem,
-
+      customFilesystem: fileSystem,
       frameworkParams: buildFrameworkParams(),
-
       ignoredFiles: buildIgnoreList(),
-
       parseRules: buildParseRules(),
-
       skipDependencyErrors: true,
-
       useScriptedClasses: false,
       loadScriptsAsync: false
     });
 
-    loadedModIds = [];
-    loadedModDirs = [];
+    var ids:Array<String> = [];
+    var dirs:Array<String> = [];
 
     if (loadedModList != null)
     {
       for (mod in loadedModList)
       {
-        loadedModDirs.push(mod.dirName);
-        loadedModIds.push(mod.id);
+        ids.push(mod.id);
+        dirs.push(mod.dirName);
       }
     }
+
+    loadedModIds = ids;
+    loadedModDirs = dirs;
   }
 
-  public static function loadScripts(async:Bool = true):lime.app.Future<
-    {success:Int, total:Int}>
+  public static function loadScripts(async:Bool = true):Future<ScriptLoadResult>
   {
     #if FEATURE_CPPIA
     polymod.hscript._internal.PolymodCppiaClassReference.expectedVersion = lime.app.Application.current.meta.get('version');
@@ -164,43 +154,48 @@ class PolymodHandler
 
     if (async)
     {
-      return Polymod.registerAllScriptClassesAsync().then((result) ->
-      {
-        var total = 0;
-        var success = 0;
-
+      return Polymod.registerAllScriptClassesAsync().then(result -> {
+        var success:Int = 0;
         for (future in result)
         {
-          total += 1;
-          if (future.isComplete) success += 1;
+          if (future.isComplete) success++;
         }
-
-        return lime.app.Future.withValue({
-          success: success,
-          total: total
-        });
+        return Future.withValue({success: success, total: result.length});
       });
     }
-    else
-    {
-      var result = Polymod.registerAllScriptClasses();
 
-      var total = result.size();
-      var success = result.values().filter((v) -> (v == true)).length;
-      return lime.app.Future.withValue({
-        success: success,
-        total: total
-      });
-    }
+    var result = Polymod.registerAllScriptClasses();
+    var success:Int = result.values().filter(v -> v == true).length;
+    return Future.withValue({success: success, total: result.size()});
   }
 
-  static function buildFileSystem():polymod.fs.ZipFileSystem
+  static function buildFileSystem():ZipFileSystem
   {
-    polymod.Polymod.onError = PolymodErrorHandler.onPolymodError;
-    return new ZipFileSystem({
-      modRoot: MOD_FOLDER,
-      autoScan: true
-    });
+    Polymod.onError = PolymodErrorHandler.onPolymodError;
+    return new ZipFileSystem({modRoot: MOD_FOLDER, autoScan: true});
+  }
+
+  static function getFileSystem(force:Bool = false):ZipFileSystem
+  {
+    var fileSystem:Null<ZipFileSystem> = modFileSystem;
+    if (fileSystem == null || force)
+    {
+      fileSystem = buildFileSystem();
+      modFileSystem = fileSystem;
+    }
+    return fileSystem;
+  }
+
+  static function tryGetFileSystem():Null<ZipFileSystem>
+  {
+    try
+    {
+      return getFileSystem();
+    }
+    catch (e:Dynamic)
+    {
+      return null;
+    }
   }
 
   static function buildImports():Void
@@ -212,7 +207,7 @@ class PolymodHandler
 
   static function buildConvenienceAliases():Void
   {
-    final DEFAULT_IMPORTS:Array<Class<Dynamic>> = [
+    final defaultImports:Array<Class<Dynamic>> = [
       funkin.Assets,
       funkin.Paths,
       funkin.Preferences,
@@ -220,7 +215,7 @@ class PolymodHandler
       flixel.FlxG
     ];
 
-    for (cls in DEFAULT_IMPORTS)
+    for (cls in defaultImports)
     {
       Polymod.addDefaultImport(cls);
     }
@@ -237,12 +232,8 @@ class PolymodHandler
     Polymod.addImportAlias('funkin.modding.base.ScriptedFunkinSprite', funkin.graphics.FunkinSprite);
     Polymod.addImportAlias('funkin.modding.base.ScriptedMusicBeatState', funkin.ui.MusicBeatState);
     Polymod.addImportAlias('funkin.modding.base.ScriptedMusicBeatSubState', funkin.ui.MusicBeatSubState);
-
-    Polymod.addImportAlias('funkin.play.character.CharacterDataParser', funkin.data.character.CharacterData.CharacterDataParser);
-
     Polymod.addImportAlias('funkin.graphics.adobeanimate.FlxAtlasSprite', funkin.graphics.FunkinSprite);
     Polymod.addImportAlias('funkin.modding.base.ScriptedFlxAtlasSprite', funkin.graphics.FunkinSprite);
-
     Polymod.addImportAlias('funkin.play.cutscene.VideoCutscene', funkin.modding.compat.VideoCutscene);
     Polymod.addImportAlias('funkin.FunkinMemory', funkin.memory.FunkinMemory);
 
@@ -256,6 +247,7 @@ class PolymodHandler
     Polymod.addImportAlias('funkin.modding.base.ScriptedFlxTransitionableState', flixel.addons.transition.FlxTransitionableState);
     Polymod.addImportAlias('funkin.modding.base.ScriptedFlxSpriteGroup', flixel.group.FlxSpriteGroup.FlxTypedSpriteGroup);
     Polymod.addImportAlias('funkin.modding.base.ScriptedFlxTypedGroup', flixel.group.FlxGroup.FlxTypedGroup);
+
     Polymod.addImportAlias('funkin.graphics.ScriptedFunkinSprite', funkin.graphics.FunkinSprite);
     Polymod.addImportAlias('funkin.group.ScriptedFunkinGroup', funkin.group.FunkinGroup);
     Polymod.addImportAlias('funkin.graphics.video.ScriptedFunkinVideoSprite', funkin.graphics.video.FunkinVideoSprite);
@@ -298,131 +290,66 @@ class PolymodHandler
     Polymod.addImportAlias('lime.utils.Assets', funkin.Assets);
     Polymod.addImportAlias('openfl.utils.Assets', funkin.Assets);
     Polymod.addImportAlias('openfl.Assets', funkin.Assets);
-
     Polymod.addImportAlias('funkin.util.FileUtil', funkin.util.FileUtilSandboxed);
 
     #if FEATURE_NEWGROUNDS
     Polymod.addImportAlias('funkin.api.newgrounds.Leaderboards', funkin.api.newgrounds.Leaderboards.LeaderboardsSandboxed);
-
     Polymod.addImportAlias('funkin.api.newgrounds.Medals', funkin.api.newgrounds.Medals.MedalsSandboxed);
-
     Polymod.addImportAlias('funkin.api.newgrounds.NewgroundsClient', funkin.api.newgrounds.NewgroundsClient.NewgroundsClientSandboxed);
     #end
 
     Polymod.addImportAlias('funkin.api.discord.DiscordClient', funkin.api.discord.DiscordClient.DiscordClientSandboxed);
-
-    Polymod.blacklistImport('Sys');
-
     Polymod.addImportAlias('Reflect', funkin.util.ReflectUtil);
-
     Polymod.addImportAlias('Type', funkin.util.ReflectUtil);
 
-    Polymod.blacklistImport('cpp.Lib');
+    final blockedImports:Array<String> = [
+      'Sys',
+      'cpp.Lib',
+      'haxe.Http',
+      'haxe.Unserializer',
+      'lime.system.CFFI',
+      'lime.system.JNI',
+      'lime.system.System',
+      'lime.utils.AssetLibrary',
+      'lime.utils.Assets',
+      'openfl.utils.Assets',
+      'openfl.Lib',
+      'openfl.system.ApplicationDomain',
+      'openfl.net.SharedObject',
+      'openfl.desktop.NativeProcess',
+      'funkin.external.android.CallbackUtil',
+      'funkin.external.android.DataFolderUtil',
+      'funkin.external.android.JNIUtil'
+    ];
 
-    Polymod.blacklistImport('haxe.Http');
-
-    Polymod.blacklistImport('haxe.Unserializer');
-
-    Polymod.blacklistImport('lime.utils.AssetLibrary');
-
-    for (cls in ClassMacro.listClassesInPackage('funkin.mobile.util'))
+    for (name in blockedImports)
     {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
+      Polymod.blacklistImport(name);
     }
 
-    for (cls in ClassMacro.listClassesInPackage('extension'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
-    }
-
-    Polymod.blacklistImport('lime.system.CFFI');
-
-    Polymod.blacklistImport('lime.system.JNI');
-
-    Polymod.blacklistImport('lime.system.System');
-
-    Polymod.blacklistImport('lime.utils.Assets');
-    Polymod.blacklistImport('openfl.utils.Assets');
-    Polymod.blacklistImport('openfl.Lib');
-    Polymod.blacklistImport('openfl.system.ApplicationDomain');
-    Polymod.blacklistImport('openfl.net.SharedObject');
-
-    Polymod.blacklistImport('openfl.desktop.NativeProcess');
+    blacklistClasses(ClassMacro.listClassesInPackage('funkin.mobile.util'));
+    blacklistClasses(ClassMacro.listClassesInPackage('extension'));
+    blacklistClasses(ClassMacro.listClassesInPackage('funkin.api'), true);
+    blacklistClasses(ClassMacro.listClassesInPackage('polymod'));
+    blacklistClasses(ClassMacro.listClassesInPackage('hscript'));
+    blacklistClasses(ClassMacro.listClassesInPackage('io.newgrounds'));
+    blacklistClasses(ClassMacro.listClassesInPackage('sys'));
+    blacklistClasses(ClassMacro.listClassesInPackage('funkin.util.macro'));
 
     Polymod.blacklistStaticFields(flixel.util.FlxSave, ['resolveFlixelClasses']);
     Polymod.blacklistStaticFields(flixel.FlxG, ['save']);
-
-    Polymod.blacklistInstanceFields(lime.utils.AssetLibrary, ['classTypes']);
-
     Polymod.blacklistStaticFields(haxe.Unserializer, ['run']);
-    Polymod.blacklistInstanceFields(haxe.Unserializer, ['unserialize']);
-
-    Polymod.blacklistInstanceFields(funkin.save.Save, [
-      'data',
-      'clearData',
-      'setLevelScore',
-      'setSongScore',
-      'applySongRank'
-    ]);
-
     Polymod.blacklistStaticFields(funkin.Assets, ['getLibrary']);
 
-    #if !html5 Polymod.blacklistInstanceFields(openfl.filesystem.FileStream, ['readObject']); #end
+    Polymod.blacklistInstanceFields(lime.utils.AssetLibrary, ['classTypes']);
+    Polymod.blacklistInstanceFields(haxe.Unserializer, ['unserialize']);
+    Polymod.blacklistInstanceFields(funkin.save.Save, ['data', 'clearData', 'setLevelScore', 'setSongScore', 'applySongRank']);
+    #if !html5
+    Polymod.blacklistInstanceFields(openfl.filesystem.FileStream, ['readObject']);
+    #end
     Polymod.blacklistInstanceFields(openfl.net.Socket, ['readObject']);
     Polymod.blacklistInstanceFields(openfl.utils.ByteArray.ByteArrayData, ['readObject']);
-
-    for (cls in ClassMacro.listClassesInPackage('funkin.api'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      if (polymod.hscript._internal.PolymodScriptClass.importOverrides.exists(className)) continue;
-      Polymod.blacklistImport(className);
-    }
-
-    for (cls in ClassMacro.listClassesInPackage('polymod'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
-    }
-
-    for (cls in ClassMacro.listClassesInPackage('hscript'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
-    }
-
-    for (cls in ClassMacro.listClassesInPackage('io.newgrounds'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
-    }
-
-    for (cls in ClassMacro.listClassesInPackage('sys'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
-    }
-
-    for (cls in ClassMacro.listClassesInPackage('funkin.util.macro'))
-    {
-      if (cls == null) continue;
-      var className:String = Type.getClassName(cls);
-      Polymod.blacklistImport(className);
-    }
-
-    Polymod.blacklistImport('funkin.external.android.CallbackUtil');
-    Polymod.blacklistImport('funkin.external.android.DataFolderUtil');
-    Polymod.blacklistImport('funkin.external.android.JNIUtil');
-
-    Polymod.blacklistInstanceFields(polymod.hscript._internal.PolymodScriptClass.PolymodScriptClass, ['_interp']);
+    Polymod.blacklistInstanceFields(PolymodScriptClass, ['_interp']);
 
     Polymod.blacklistDynamicFieldNames([
       'resolveFlixelClasses',
@@ -438,39 +365,35 @@ class PolymodHandler
     ]);
   }
 
-  static function buildIgnoreList():Array<String>
+  static function blacklistClasses(classes:Iterable<Null<Class<Dynamic>>>, skipOverrides:Bool = false):Void
   {
-    var result = Polymod.getDefaultIgnoreList();
-
-    result.push('.vscode');
-    result.push('.idea');
-    result.push('.git');
-    result.push('.gitignore');
-    result.push('.gitattributes');
-    result.push('.jj');
-    result.push('.DS_Store');
-    result.push('README.md');
-    result.push('cppia-src');
-    result.push('build.sh');
-    result.push('build.ps1');
-
-    return result;
+    for (cls in classes)
+    {
+      if (cls == null) continue;
+      var className:String = Type.getClassName(cls);
+      if (skipOverrides && PolymodScriptClass.importOverrides.exists(className)) continue;
+      Polymod.blacklistImport(className);
+    }
   }
 
-  static function buildParseRules():polymod.format.ParseRules
+  static function buildIgnoreList():Array<String>
   {
-    var output:polymod.format.ParseRules = polymod.format.ParseRules.getDefault();
-    output.addType('txt', TextFileFormat.LINES);
+    return Polymod.getDefaultIgnoreList().concat(IGNORED_FILES);
+  }
 
+  static function buildParseRules():ParseRules
+  {
+    var output:ParseRules = ParseRules.getDefault();
+    output.addType('txt', TextFileFormat.LINES);
     return output;
   }
 
-  static inline function buildFrameworkParams():polymod.Polymod.FrameworkParams
+  static inline function buildFrameworkParams():FrameworkParams
   {
     return {
       assetLibraryPaths: ['default' => ''],
-      coreAssetRedirect: CORE_FOLDER,
-    }
+      coreAssetRedirect: CORE_FOLDER
+    };
   }
 
   public static function getAllMods(force:Bool = false):Array<ModMetadata>
@@ -485,120 +408,96 @@ class PolymodHandler
 
   static function scanMods(includeIncompatible:Bool, force:Bool):Array<ModMetadata>
   {
-    var modMetadata:Array<ModMetadata> = [];
     try
     {
-      if (modFileSystem == null || force) modFileSystem = buildFileSystem();
-
-      var scanParams:Dynamic = {
+      var result:Null<Array<ModMetadata>> = Polymod.scan({
         modRoot: MOD_FOLDER,
-        fileSystem: modFileSystem,
-        errorCallback: PolymodErrorHandler.onPolymodError
-      };
-      if (!includeIncompatible) scanParams.apiVersionRule = API_VERSION_RULE;
-      modMetadata = Polymod.scan(scanParams);
+        fileSystem: getFileSystem(force),
+        errorCallback: PolymodErrorHandler.onPolymodError,
+        apiVersionRule: includeIncompatible ? null : API_VERSION_RULE
+      });
+      return result ?? [];
     }
     catch (e:Dynamic)
     {
       return [];
     }
-    return modMetadata;
   }
 
-  public static function isModCompatible(mod:ModMetadata):Bool
+  public static function isModCompatible(mod:Null<ModMetadata>):Bool
   {
-    if (mod == null) return true;
-    return mod.isCompatible(API_VERSION_RULE);
+    return mod != null && mod.isCompatible(API_VERSION_RULE);
   }
 
   public static function getAllModIds():Array<String>
   {
-    var modIds:Array<String> = [for (i in getAllMods()) i.id];
-    return modIds;
+    return [for (mod in getAllMods()) mod.id];
   }
 
   public static function getAllModDirs():Array<String>
   {
-    var modDirs:Array<String> = [for (i in getAllMods()) i.dirName];
-    return modDirs;
+    return [for (mod in getAllMods()) mod.dirName];
   }
 
   public static function enableMod(modId:String):Void
   {
-    var enabledModIds:Array<String> = Save.instance.enabledModIds.value;
-    if (!enabledModIds.contains(modId))
-    {
-      enabledModIds.push(modId);
-      Save.instance.enabledModIds.value = enabledModIds;
-      Save.system.flush();
-    }
+    var enabledModIds:Array<String> = Save.instance.enabledModIds.value.copy();
+    if (enabledModIds.contains(modId)) return;
+    enabledModIds.push(modId);
+    saveEnabledModIds(enabledModIds);
   }
 
   public static function disableMod(modId:String):Void
   {
     var enabledModIds:Array<String> = Save.instance.enabledModIds.value;
-    if (enabledModIds.contains(modId))
-    {
-      enabledModIds.remove(modId);
-      Save.instance.enabledModIds.value = enabledModIds;
-      Save.system.flush();
-    }
+    if (!enabledModIds.contains(modId)) return;
+    saveEnabledModIds(enabledModIds.filter(id -> id != modId));
   }
 
   public static function disableAllMods():Void
   {
-    Save.instance.enabledModIds.value = [];
+    saveEnabledModIds([]);
+  }
+
+  public static function pruneIncompatibleMods():Void
+  {
+    var availableIds:Array<String> = getAllModIds();
+    var enabledModIds:Array<String> = Save.instance.enabledModIds.value;
+    var validIds:Array<String> = enabledModIds.filter(id -> availableIds.contains(id));
+    if (validIds.length != enabledModIds.length) saveEnabledModIds(validIds);
+  }
+
+  static function saveEnabledModIds(modIds:Array<String>):Void
+  {
+    Save.instance.enabledModIds.value = modIds;
     Save.system.flush();
   }
 
   public static function getEnabledMods():Array<ModMetadata>
   {
     var enabledModIds:Array<String> = Save.instance.enabledModIds.value;
-    var modMetadata:Array<ModMetadata> = getAllMods();
-    var enabledMods:Array<ModMetadata> = modMetadata.filter((item) ->
-    {
-      return enabledModIds.contains(item.id);
-    });
-
-    enabledMods.sort((a, b) ->
-    {
-      return enabledModIds.indexOf(a.id) - enabledModIds.indexOf(b.id);
-    });
-
+    var enabledMods:Array<ModMetadata> = getAllMods().filter(mod -> enabledModIds.contains(mod.id));
+    enabledMods.sort((a, b) -> enabledModIds.indexOf(a.id) - enabledModIds.indexOf(b.id));
     return enabledMods;
   }
 
   public static function getDisabledMods():Array<ModMetadata>
   {
-    var modMetadata:Array<ModMetadata> = getAllMods();
     var enabledModIds:Array<String> = Save.instance.enabledModIds.value;
-    var disabledMods:Array<ModMetadata> = modMetadata.filter((item) ->
-    {
-      return !enabledModIds.contains(item.id);
-    });
-
-    disabledMods.sort((a, b) ->
-    {
-      return SortUtil.alphabetically(a.title, b.title);
-    });
-
+    var disabledMods:Array<ModMetadata> = getAllMods().filter(mod -> !enabledModIds.contains(mod.id));
+    disabledMods.sort((a, b) -> SortUtil.alphabetically(a.title, b.title));
     return disabledMods;
   }
 
   public static function getDisabledModsIncludingIncompatible(force:Bool = false):Array<ModMetadata>
   {
-    var modMetadata:Array<ModMetadata> = getAllModsIncludingIncompatible(force);
     var enabledModIds:Array<String> = Save.instance.enabledModIds.value;
-    var disabledMods:Array<ModMetadata> = modMetadata.filter((item) ->
-    {
-      return !enabledModIds.contains(item.id);
-    });
+    var disabledMods:Array<ModMetadata> = getAllModsIncludingIncompatible(force).filter(mod -> !enabledModIds.contains(mod.id));
 
-    disabledMods.sort((a, b) ->
-    {
+    disabledMods.sort((a, b) -> {
       var aCompatible:Bool = isModCompatible(a);
       var bCompatible:Bool = isModCompatible(b);
-      if (aCompatible != bCompatible) return aCompatible ? 1 : -1;
+      if (aCompatible != bCompatible) return aCompatible ? -1 : 1;
       return SortUtil.alphabetically(a.title, b.title);
     });
 
@@ -610,7 +509,7 @@ class PolymodHandler
     ModuleHandler.clearModuleCache();
     Polymod.clearScripts();
 
-    funkin.modding.PolymodHandler.loadEnabledMods();
+    loadEnabledMods();
 
     SongEventRegistry.loadEventCache();
 
